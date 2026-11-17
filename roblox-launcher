@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# roblox-launcher - locked-down Roblox runtime wrapper for ARM64 SBCs
+# Runs the official Android Roblox client inside a debloated VANILLA Waydroid
+# container, wrapped in gamescope, with performance modes and zero residue.
+#
+# Subcommands: setup play stop status doctor update open-aurora app config
+#              reset-data reset-container debloat-restore uninstall version help
+
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+export SELF_PATH
+
+# Locate library dir: installed deb, /usr/local (install.sh), relocated tree,
+# or source tree
+if [ -d "/usr/lib/roblox-arm64-launcher/lib" ]; then
+    LIB_DIR="/usr/lib/roblox-arm64-launcher/lib"
+elif [ -d "/usr/local/lib/roblox-arm64-launcher/lib" ]; then
+    LIB_DIR="/usr/local/lib/roblox-arm64-launcher/lib"
+elif [ -d "$(dirname "$SELF_PATH")/../lib/roblox-arm64-launcher/lib" ]; then
+    LIB_DIR="$(readlink -f "$(dirname "$SELF_PATH")/../lib/roblox-arm64-launcher/lib")"
+else
+    LIB_DIR="$(dirname "$SELF_PATH")/lib"
+fi
+
+for _lib in common gatekeeper distro waydroid_init debloat aurora perf cec run doctor; do
+    # shellcheck disable=SC1091
+    source "$LIB_DIR/$_lib.sh" || { echo "FATAL: cannot load lib/$_lib.sh" >&2; exit 1; }
+done
+
+usage() {
+    cat <<'USAGE'
+roblox-launcher - Roblox runtime wrapper for ARM64 SBCs (Waydroid + gamescope)
+
+USAGE:
+  roblox-launcher <command> [args]
+
+COMMANDS:
+  setup [--hard]       One-time gatekeeper + Waydroid VANILLA init + debloat
+                       + Aurora Store (anonymous) + bridges. Resumable.
+  play [URI]           Start the Roblox session. URI may be a roblox-player://
+                       deep link from the Roblox website ("Play" button).
+  stop                 Stop the session, stop the container, revert governors.
+  status               Quick status: container, session, Roblox PID, perf mode.
+  doctor               Full diagnostics report (hardware gate, props, bridges).
+  update               Open Aurora Store (anonymous) to update Roblox.
+  open-aurora          Alias of update.
+  app install FILE...  Sideload APK(s) (split-APK lists supported).
+  app list             List installed Android apps.
+  config get KEY       Print a config value.
+  config set KEY VAL   Set a config value.
+  config list          Show all config overrides.
+  reset-data           Clear Android app data of everything except Roblox +
+                       Aurora Store (keeps login tokens).
+  reset-container      Delete the Waydroid image and data; re-run setup.
+  debloat-restore      Undo the reversible pm-uninstall debloating.
+  uninstall [--purge-android]   Remove launcher data (and optionally Android).
+  version              Print version.
+  help                 This help.
+
+CONFIG KEYS (defaults):
+  DPI=160                  Android density (desktop-style)
+  RESOLUTION=auto          gamescope buffer size WxH (auto = display native)
+  FPS=auto                 gamescope refresh cap
+  GAMESCOPE=auto           auto|yes|no - wrap the window in gamescope
+  FULLSCREEN=1             Start gamescope fullscreen
+  VRR=0                    gamescope adaptive-sync (if supported)
+  CEC_ON_LAUNCH=0          HDMI-CEC power-on when session starts
+  CEC_STANDBY_EXIT=0       HDMI-CEC standby when session ends
+  CEC_DEVICE=auto          Which /dev/cec* adapter
+  KEEP_CONTAINER_SERVICE=0 1 keeps waydroid-container.service boot-enabled
+
+FILES:
+  ~/.local/share/.roblox-runtime/    hidden runtime: state, backups, logs, cache
+  ~/Pictures/Roblox                  screenshots land here (bind-mounted)
+USAGE
+}
+
+cmd_status() {
+    rt_init_dirs
+    echo "== $ROBLOX_LAUNCHER_NAME $ROBLOX_LAUNCHER_VERSION =="
+    echo "runtime dir : $RT_DIR"
+    if have waydroid; then
+        echo "waydroid    : $(waydroid status 2>/dev/null | tr '\n' ' ' || echo 'container not running')"
+    else
+        echo "waydroid    : not installed"
+    fi
+    local pid
+    pid="$(state_get roblox.pid "")"
+    echo "roblox pid  : ${pid:-none}"
+    echo "perf mode   : $([ -f "$RT_STATE_DIR/perf.on" ] && echo LOCKED || echo released)"
+    echo "gamescope   : $(state_get gamescope.pid "")"
+    echo "last gate   : $(state_get gate.result "not run yet")"
+    [ "$(state_get reboot-required "")" = "1" ] && echo "NOTE        : reboot required (4K-page kernel switch)"
+}
+
+cmd_setup() {
+    local hard=0
+    [ "${SETUP_HARD:-0}" = "1" ] && hard=1
+    rt_init_dirs
+
+    banner "$ROBLOX_LAUNCHER_NAME setup (v$ROBLOX_LAUNCHER_VERSION)"
+    log_info "This will: verify hardware, add the Waydroid apt repo, install packages,"
+    log_info "initialize a VANILLA (Google-free) Android image, debloat it, install"
+    log_info "Aurora Store (anonymous), bridge screenshots to ~/Pictures/Roblox and"
+    log_info "keep the container UNROOTED for anti-cheat compatibility."
+    if [ "$hard" = "1" ]; then
+        log_info "HARD debloat requested: app directories will be deleted from the"
+        log_info "system image (backed up first, ~1 GB) and the image set read-only."
+    fi
+    if ! confirm "Proceed with setup?" "y"; then
+        die "Setup aborted by user." 1
+    fi
+
+    # Stage 1: gatekeeper (hard block stops setup)
+    if ! state_progress_has gate; then
+        if run_gate strict; then
+            state_progress_add gate
+        else
+            die "Hardware gate BLOCKED setup. See messages above." 1
+        fi
+    else
+        log_ok "Stage gate: already passed."
+    fi
+
+    # Stage 2: distro packages (Debian family path)
+    if ! state_progress_has distro; then
+        detect_distro || die "Unsupported distro: cannot read /etc/os-release." 1
+        if [ "$DISTRO_FAMILY" = "debian" ]; then
+            apt_repo_waydroid && apt_install_pkgs
+        else
+            log_warn "Distro family '$DISTRO_FAMILY' - skipping apt setup."
+            log_warn "Use install.sh (supports Arch-based distros like Orange Pi OS Arch)."
+        fi
+        pi_page_kernel_fix
+        disable_waydroid_autostart
+        mask_waydroid_desktop
+        state_progress_add distro
+    else
+        log_ok "Stage distro: already done."
+    fi
+
+    # Stage 3: waydroid vanilla init + props + bridges
+    if ! state_progress_has waydroid; then
+        waydroid_init_vanilla
+        set_runtime_props
+        setup_shared_folder
+        state_progress_add waydroid
+    else
+        log_ok "Stage waydroid: already done."
+    fi
+
+    # Stage 4: debloat (extended set; optional hard strip)
+    if ! state_progress_has debloat; then
+        if [ "$hard" = "1" ]; then debloat_run --hard; else debloat_run; fi
+        state_progress_add debloat
+    else
+        log_ok "Stage debloat: already done (roblox-launcher reset-container to redo)."
+    fi
+
+    # Stage 5: Aurora Store
+    if ! state_progress_has aurora; then
+        if aurora_install; then
+            state_progress_add aurora
+        else
+            log_warn "Aurora install failed; setup continues (retry later with: roblox-launcher update)."
+            state_progress_add aurora
+        fi
+    else
+        log_ok "Stage aurora: already done."
+    fi
+
+    # Stage 6: first-boot pass (uimode normal, unrooted checks) + ready marker
+    if ! state_progress_has firstboot; then
+        first_boot_prepare
+        state_progress_add firstboot
+    else
+        log_ok "Stage firstboot: already done."
+    fi
+
+    state_set waydroid.ready 1
+    banner "Setup complete"
+    log_ok "Next: run 'roblox-launcher play' (or click Roblox in the app menu, or"
+    log_ok "click Play on the Roblox website - roblox-player:// links are handled)."
+    if [ "$(state_get reboot-required "")" = "1" ]; then
+        log_warn "REBOOT FIRST: the 4K-page kernel switch is pending."
+    fi
+}
+
+cmd_config() {
+    case "${1:-}" in
+        get)  config_get "${2:-}" ""; echo ;;
+        set)  [ -n "${2:-}" ] || die "Usage: roblox-launcher config set KEY VALUE" 2
+              config_set "$2" "${3:-}" && log_ok "config: $2=${3:-}" ;;
+        list) config_list ;;
+        *)    die "Usage: roblox-launcher config get|set|list ..." 2 ;;
+    esac
+}
+
+cmd_app() {
+    case "${1:-}" in
+        install) shift; app_install_apks "$@" ;;
+        list)    app_list_installed ;;
+        *)       die "Usage: roblox-launcher app install FILE... | app list" 2 ;;
+    esac
+}
+
+cmd_reset_data() {
+    banner "Reset Android app data (except Roblox + Aurora)"
+    confirm "This clears app data of every installed app except com.roblox.client and com.aurora.store. Continue?" "n" \
+        || die "Aborted." 1
+    ensure_container
+    local keep=" $ROBLOX_ANDROID_PKG $AURORA_ANDROID_PKG "
+    local p
+    for p in $(waydroid shell pm list packages -3 2>/dev/null | sed -n 's/^package://p'); do
+        case "$keep" in *" $p "*) continue ;; esac
+        waydroid shell pm clear "$p" >/dev/null 2>&1 \
+            && log_ok "cleared data: $p" \
+            || log_warn "could not clear: $p"
+    done
+    stop_container_fully
+    log_ok "Only /data/data/com.roblox.client (and Aurora) preserved across launches."
+}
+
+cmd_uninstall() {
+    banner "Uninstall launcher runtime data"
+    confirm "Remove $RT_DIR (state, backups, logs, cache)?" "y" || die "Aborted." 1
+    cmd_stop >/dev/null 2>&1 || true
+    rm -rf "$RT_DIR"
+    log_ok "Removed $RT_DIR"
+    # Clean scheme-handler associations
+    if [ -f ~/.config/mimeapps.list ]; then
+        sed -i '/x-scheme-handler\/roblox/d' ~/.config/mimeapps.list 2>/dev/null || true
+    fi
+    if [ "${PURGE_ANDROID:-0}" = "1" ]; then
+        confirm "ALSO delete the Waydroid image and all Android data (/var/lib/waydroid)?" "n" \
+            || { log_ok "Android data kept."; return 0; }
+        root_run systemctl stop waydroid-container.service >/dev/null 2>&1 || true
+        root_run rm -rf /var/lib/waydroid
+        log_ok "Removed /var/lib/waydroid. To remove Waydroid itself: sudo apt purge waydroid"
+    fi
+    log_ok "To remove the package: sudo dpkg -r roblox-arm64-launcher"
+}
+
+main() {
+    rt_init_dirs
+
+    # Global flags
+    local args=()
+    local a
+    for a in "$@"; do
+        case "$a" in
+            -y|--yes) ASSUME_YES=1; export ASSUME_YES ;;
+            *)        args+=("$a") ;;
+        esac
+    done
+    [ "${#args[@]}" -gt 0 ] || { usage; exit 0; }
+
+    local cmd="${args[0]}"
+    shift_args=("${args[@]:1}")
+    set -- "${shift_args[@]}"
+
+    case "$cmd" in
+        setup)
+            SETUP_HARD=0
+            for a in "$@"; do
+                case "$a" in --hard) SETUP_HARD=1 ;; *) ;; esac
+            done
+            cmd_setup ;;
+        play)        cmd_play "${1:-}" ;;
+        stop)        cmd_stop ;;
+        status)      cmd_status ;;
+        doctor)      cmd_doctor ;;
+        update|open-aurora) open_aurora ;;
+        app)         cmd_app "${1:-}" "${@:2}" ;;
+        config)      cmd_config "${1:-}" "${2:-}" "${3:-}" ;;
+        reset-data)  cmd_reset_data ;;
+        reset-container) reset_container ;;
+        debloat-restore) debloat_restore ;;
+        uninstall)
+            for a in "$@"; do
+                case "$a" in --purge-android) PURGE_ANDROID=1 ;; esac
+            done
+            cmd_uninstall ;;
+        version|--version|-V) echo "$ROBLOX_LAUNCHER_NAME $ROBLOX_LAUNCHER_VERSION" ;;
+        help|--help|-h|"") usage ;;
+        _inner)     session_inner ;;   # internal: gamescope entry point
+        *)          echo "Unknown command: $cmd" >&2; usage; exit 2 ;;
+    esac
+}
+
+main "$@"
