@@ -14,15 +14,7 @@ What It Does
 How to Install & Test (Debian / Ubuntu / Armbian / Raspberry Pi OS)
 
 bash
-curl -fLO https://github.com
-
-sudo apt update && sudo apt install -y ./roblox-arm64-launcher.deb
-
-roblox-launcher setup
-
-roblox-launcher play
-
-Use code with caution.
+curl -fLO https://github.com && sudo apt update && sudo apt install -y ./roblox-arm64-launcher.deb && roblox-launcher setup && roblox-launcher play
 
 How You Can Help Improve It
 
